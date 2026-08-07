@@ -15,8 +15,8 @@ The current build is locally signed rather than Apple-notarized. On first launch
 ## What the number means
 
 - `600 nits` is the calibrated SDR luminance reported by macOS.
-- `≈1,050 nits` means a software EDR tool is scaling desktop white above SDR; the app combines the reported SDR luminance with the active display transfer gain.
-- The dropdown separately shows the localized HDR peak currently exposed by the display.
+- `≈1,050 nits` means a software EDR tool is scaling desktop white above SDR; the app combines the current SDR reference white with the live display transfer gain. BrightIntosh's alternate HDR-overlay backend is detected separately because it does not change that transfer table.
+- The dropdown separately shows the physical peak reported by the display's capability data.
 
 NitsBar is a live system estimate, not a physical colorimeter measurement. It uses macOS's own panel calculation and display pipeline state.
 
@@ -33,6 +33,6 @@ The app is a single Swift source file with no third-party dependencies.
 
 ## Compatibility and privacy
 
-NitsBar dynamically reads Apple's private `BrightnessControl` framework. On built-in Liquid Retina XDR displays where macOS 26 refuses the calibrated-nits getter, it falls back to the live fixed-point luminance published by the built-in display framebuffer. It has been tested on Studio Display XDR and a built-in Liquid Retina XDR display with macOS 26.6. Because these are not public APIs, a future macOS update could require an adjustment.
+NitsBar dynamically reads Apple's private `BrightnessControl` and `DisplayServices` frameworks. On built-in Liquid Retina XDR displays where macOS 26 refuses the calibrated-nits getter, it derives current SDR reference white from the calibrated range and Apple's live linear-brightness value. The physical EDR peak comes from the display capability dictionary, so temporary EDR headroom cannot be mislabeled as a multi-thousand-nit panel. It has been tested on Studio Display XDR and a built-in Liquid Retina XDR display with macOS 26.6. Because these are not public APIs, a future macOS update could require an adjustment.
 
 No administrator access, log access, network connection, telemetry, or helper process is used. NitsBar is not affiliated with Apple.
