@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import IOKit
 import ObjectiveC.runtime
 import ServiceManagement
 
@@ -43,19 +44,37 @@ private final class BrightnessReader {
     }
 
     func currentReading() -> LuminanceReading? {
-        guard let sdrNits = currentSDRNits() else { return nil }
         let headroom = currentEDRHeadroom()
-        let gain = min(currentTransferGain(), headroom)
+        if let sdrNits = currentCalibratedSDRNits() {
+            let gain = min(currentTransferGain(), headroom)
+
+            return LuminanceReading(
+                sdrNits: sdrNits,
+                edrGain: gain,
+                effectiveNits: sdrNits * gain,
+                edrCeilingNits: sdrNits * headroom
+            )
+        }
+
+        // On current Liquid Retina XDR MacBook displays, BrightnessControl
+        // exposes calibrated min/max values but getNitsWithError: returns
+        // "Device doesn't support current operation". The built-in DCP
+        // framebuffer still publishes the live panel luminance as a 16.16
+        // fixed-point nit value. It already includes any active EDR boost.
+        guard let effectiveNits = currentBuiltInPanelNits() else { return nil }
+        let sdrCeiling = maximumNits.flatMap { $0 > 0 ? $0 : nil } ?? effectiveNits
+        let sdrNits = min(effectiveNits, sdrCeiling)
+        let gain = sdrNits > 0 ? max(1, effectiveNits / sdrNits) : 1
 
         return LuminanceReading(
             sdrNits: sdrNits,
             edrGain: gain,
-            effectiveNits: sdrNits * gain,
-            edrCeilingNits: sdrNits * headroom
+            effectiveNits: effectiveNits,
+            edrCeilingNits: max(effectiveNits, sdrCeiling * headroom)
         )
     }
 
-    private func currentSDRNits() -> Double? {
+    private func currentCalibratedSDRNits() -> Double? {
         guard let control else { return nil }
         let selector = NSSelectorFromString("getNitsWithError:")
         guard let method = class_getInstanceMethod(type(of: control), selector) else { return nil }
@@ -65,6 +84,46 @@ private final class BrightnessReader {
         let value = function(control, selector, &error)
         guard error == nil, value.isFinite, value >= 0 else { return nil }
         return value
+    }
+
+    private func currentBuiltInPanelNits() -> Double? {
+        for className in ["IOMobileFramebufferShim", "IOMobileFramebuffer"] {
+            guard let matching = IOServiceMatching(className) else { continue }
+            var iterator: io_iterator_t = 0
+            guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+                continue
+            }
+            defer { IOObjectRelease(iterator) }
+
+            var service = IOIteratorNext(iterator)
+            while service != 0 {
+                let currentService = service
+                defer { IOObjectRelease(currentService) }
+
+                let external = IORegistryEntryCreateCFProperty(
+                    currentService,
+                    "external" as CFString,
+                    kCFAllocatorDefault,
+                    0
+                )?.takeRetainedValue() as? NSNumber
+
+                if external?.boolValue != true,
+                   let fixedPoint = IORegistryEntryCreateCFProperty(
+                       currentService,
+                       "IOMFBBrightnessLevel" as CFString,
+                       kCFAllocatorDefault,
+                       0
+                   )?.takeRetainedValue() as? NSNumber {
+                    let nits = fixedPoint.doubleValue / 65_536
+                    if nits.isFinite, nits > 0, nits < 10_000 {
+                        return nits
+                    }
+                }
+
+                service = IOIteratorNext(iterator)
+            }
+        }
+        return nil
     }
 
     private func currentTransferGain() -> Double {
@@ -111,8 +170,19 @@ private final class BrightnessReader {
         // Apple displays connected over USB/Thunderbolt expose their calibrated
         // luminance through the HID controller. Built-in displays use the
         // AppleBacklight controller, so keep that as a fallback.
+        var calibratedFallback: NSObject?
         for className in ["BCHIDBrtControl", "BCAppleBacklightBrtControl"] {
             for candidate in availableControls(forClassNamed: className) {
+                if calibratedFallback == nil,
+                   candidate.responds(to: NSSelectorFromString("minNits")),
+                   candidate.responds(to: NSSelectorFromString("maxNits")),
+                   let minimum = candidate.value(forKey: "minNits") as? Double,
+                   let maximum = candidate.value(forKey: "maxNits") as? Double,
+                   minimum >= 0,
+                   maximum > minimum {
+                    calibratedFallback = candidate
+                }
+
                 let selector = NSSelectorFromString("getNitsWithError:")
                 guard let method = class_getInstanceMethod(type(of: candidate), selector) else { continue }
                 let function = unsafeBitCast(method_getImplementation(method), to: GetNitsFunction.self)
@@ -123,7 +193,7 @@ private final class BrightnessReader {
                 }
             }
         }
-        return nil
+        return calibratedFallback
     }
 
     private func availableControls(forClassNamed className: String) -> [NSObject] {

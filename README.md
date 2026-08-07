@@ -8,7 +8,7 @@ The value stays visible in the menu bar and updates automatically as brightness 
 
 ## Download
 
-Download `NitsBar-0.2.0-arm64.zip` from the [latest release](../../releases/latest), unzip it, and move `NitsBar.app` to Applications.
+Download the latest `NitsBar` zip from the [latest release](../../releases/latest), unzip it, and move `NitsBar.app` to Applications.
 
 The current build is locally signed rather than Apple-notarized. On first launch, macOS may require you to Control-click the app, choose **Open**, and confirm. Managed Macs may block unnotarized apps entirely.
 
@@ -33,6 +33,6 @@ The app is a single Swift source file with no third-party dependencies.
 
 ## Compatibility and privacy
 
-NitsBar dynamically reads Apple's private `BrightnessControl` framework. It has been tested on Studio Display XDR with macOS 26.6 and includes a built-in-display fallback. Because this is not a public API, a future macOS update could require an adjustment.
+NitsBar dynamically reads Apple's private `BrightnessControl` framework. On built-in Liquid Retina XDR displays where macOS 26 refuses the calibrated-nits getter, it falls back to the live fixed-point luminance published by the built-in display framebuffer. It has been tested on Studio Display XDR and a built-in Liquid Retina XDR display with macOS 26.6. Because these are not public APIs, a future macOS update could require an adjustment.
 
 No administrator access, log access, network connection, telemetry, or helper process is used. NitsBar is not affiliated with Apple.

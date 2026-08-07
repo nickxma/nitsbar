@@ -14,11 +14,13 @@ xcrun swiftc \
   -parse-as-library \
   -O \
   -framework AppKit \
+  -framework IOKit \
   -framework ServiceManagement \
   "$project_dir/NitsBar.swift" \
   -o "$contents_dir/MacOS/NitsBar"
 
 cp "$project_dir/Info.plist" "$contents_dir/Info.plist"
+xattr -cr "$app_dir"
 codesign --force --sign - "$app_dir"
 
 echo "$app_dir"
