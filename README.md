@@ -25,7 +25,7 @@ NitsBar is a live system estimate, not a physical colorimeter measurement. It us
 Requires macOS 13 or later and Xcode or the Xcode command-line tools:
 
 ```sh
-./build.sh
+zsh build.sh
 open build/NitsBar.app
 ```
 
