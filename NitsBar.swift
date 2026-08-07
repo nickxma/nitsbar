@@ -1,9 +1,13 @@
 import AppKit
 import Foundation
+import IOKit
 import ObjectiveC.runtime
 import ServiceManagement
 
 private let brightnessFrameworkPath = "/System/Library/PrivateFrameworks/BrightnessControl.framework/BrightnessControl"
+private let displayServicesFrameworkPath = "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices"
+private let brightIntoshBundleIdentifier = "de.brightintosh.app"
+private let brightIntoshDefaultsSuite = "group.de.brightintosh.app"
 
 private struct LuminanceReading {
     let sdrNits: Double
@@ -17,15 +21,25 @@ private struct LuminanceReading {
 private final class BrightnessReader {
     private typealias CopyControlsFunction = @convention(c) (AnyClass, Selector) -> Unmanaged<AnyObject>?
     private typealias GetNitsFunction = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<AnyObject?>?) -> Double
+    private typealias GetLinearBrightnessFunction = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
 
     private var frameworkHandle: UnsafeMutableRawPointer?
+    private var displayServicesHandle: UnsafeMutableRawPointer?
+    private var getLinearBrightness: GetLinearBrightnessFunction?
     private var control: NSObject?
+    private var isBuiltInDisplay = false
     private(set) var displayName = "Display"
     private(set) var minimumNits: Double?
     private(set) var maximumNits: Double?
+    private(set) var physicalPeakNits: Double?
 
     init() {
         frameworkHandle = dlopen(brightnessFrameworkPath, RTLD_NOW)
+        displayServicesHandle = dlopen(displayServicesFrameworkPath, RTLD_NOW)
+        if let displayServicesHandle,
+           let symbol = dlsym(displayServicesHandle, "DisplayServicesGetLinearBrightness") {
+            getLinearBrightness = unsafeBitCast(symbol, to: GetLinearBrightnessFunction.self)
+        }
         refreshDisplay()
     }
 
@@ -33,29 +47,64 @@ private final class BrightnessReader {
         if let frameworkHandle {
             dlclose(frameworkHandle)
         }
+        if let displayServicesHandle {
+            dlclose(displayServicesHandle)
+        }
     }
 
     func refreshDisplay() {
         displayName = NSScreen.main?.localizedName ?? NSScreen.screens.first?.localizedName ?? "Display"
+        isBuiltInDisplay = CGDisplayIsBuiltin(CGMainDisplayID()) != 0
         control = findReadableControl()
         minimumNits = control?.value(forKey: "minNits") as? Double
         maximumNits = control?.value(forKey: "maxNits") as? Double
+        physicalPeakNits = currentPhysicalPeakNits()
     }
 
     func currentReading() -> LuminanceReading? {
-        guard let sdrNits = currentSDRNits() else { return nil }
-        let headroom = currentEDRHeadroom()
-        let gain = min(currentTransferGain(), headroom)
+        guard let sdrNits = currentCalibratedSDRNits() ?? currentBuiltInSDRNits() else { return nil }
+        let transferGain = currentTransferGain()
+        let overlayGain = currentBrightIntoshOverlayGain()
+        let uncappedGain = max(1, transferGain * overlayGain)
+        let peak = physicalPeakNits ?? maximumNits ?? sdrNits
+        let effectiveNits = min(sdrNits * uncappedGain, peak)
+        let gain = sdrNits > 0 ? effectiveNits / sdrNits : 1
 
         return LuminanceReading(
             sdrNits: sdrNits,
             edrGain: gain,
-            effectiveNits: sdrNits * gain,
-            edrCeilingNits: sdrNits * headroom
+            effectiveNits: effectiveNits,
+            edrCeilingNits: max(effectiveNits, peak)
         )
     }
 
-    private func currentSDRNits() -> Double? {
+    func diagnosticLine() -> String {
+        guard let reading = currentReading() else { return "unavailable" }
+        return String(
+            format: "sdr=%.3f gain=%.4f effective=%.3f peak=%.3f display=%@",
+            reading.sdrNits,
+            reading.edrGain,
+            reading.effectiveNits,
+            reading.edrCeilingNits,
+            displayName
+        )
+    }
+
+    private func currentBuiltInSDRNits() -> Double? {
+        guard isBuiltInDisplay,
+              let getLinearBrightness,
+              let maximumNits,
+              maximumNits > 0 else { return nil }
+
+        var linearBrightness: Float = 0
+        guard getLinearBrightness(CGMainDisplayID(), &linearBrightness) == 0,
+              linearBrightness.isFinite else { return nil }
+
+        let minimum = max(0, minimumNits ?? 0)
+        return max(minimum, maximumNits * min(max(Double(linearBrightness), 0), 1))
+    }
+
+    private func currentCalibratedSDRNits() -> Double? {
         guard let control else { return nil }
         let selector = NSSelectorFromString("getNitsWithError:")
         guard let method = class_getInstanceMethod(type(of: control), selector) else { return nil }
@@ -65,6 +114,60 @@ private final class BrightnessReader {
         let value = function(control, selector, &error)
         guard error == nil, value.isFinite, value >= 0 else { return nil }
         return value
+    }
+
+    private func currentBuiltInPanelNits() -> Double? {
+        for className in ["IOMobileFramebufferShim", "IOMobileFramebuffer"] {
+            guard let matching = IOServiceMatching(className) else { continue }
+            var iterator: io_iterator_t = 0
+            guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+                continue
+            }
+            defer { IOObjectRelease(iterator) }
+
+            var service = IOIteratorNext(iterator)
+            while service != 0 {
+                let currentService = service
+                defer { IOObjectRelease(currentService) }
+
+                let external = IORegistryEntryCreateCFProperty(
+                    currentService,
+                    "external" as CFString,
+                    kCFAllocatorDefault,
+                    0
+                )?.takeRetainedValue() as? NSNumber
+
+                if external?.boolValue != true,
+                   let fixedPoint = IORegistryEntryCreateCFProperty(
+                       currentService,
+                       "IOMFBBrightnessLevel" as CFString,
+                       kCFAllocatorDefault,
+                       0
+                   )?.takeRetainedValue() as? NSNumber {
+                    let nits = fixedPoint.doubleValue / 65_536
+                    if nits.isFinite, nits > 0, nits < 10_000 {
+                        return nits
+                    }
+                }
+
+                service = IOIteratorNext(iterator)
+            }
+        }
+        return nil
+    }
+
+    private func currentPhysicalPeakNits() -> Double? {
+        let capabilities = control?.value(forKey: "capabilities") as? NSDictionary
+        for key in ["MaxNitsEDR", "MaxNitsPanel", "LmaxProduct"] {
+            if let value = capabilities?[key] as? NSNumber {
+                let nits = value.doubleValue
+                if nits.isFinite, nits > 0 { return nits }
+            }
+        }
+        return currentBuiltInPanelNits().flatMap { panelNits in
+            guard let maximumNits, panelNits > maximumNits else { return nil }
+            return panelNits
+        }
     }
 
     private func currentTransferGain() -> Double {
@@ -107,12 +210,59 @@ private final class BrightnessReader {
         return max(1, headroom)
     }
 
+    private func currentBrightIntoshOverlayGain() -> Double {
+        guard NSRunningApplication.runningApplications(withBundleIdentifier: brightIntoshBundleIdentifier)
+            .contains(where: { !$0.isTerminated }),
+              let defaults = UserDefaults(suiteName: brightIntoshDefaultsSuite),
+              defaults.bool(forKey: "active"),
+              defaults.bool(forKey: "useAlternateBrightnessBackend") else {
+            return 1
+        }
+
+        let headroom = currentEDRHeadroom()
+        guard headroom > 1.05 else { return 1 }
+
+        let referenceEDR: Double
+        let bonus: Double
+        if isBuiltInDisplay {
+            if (maximumNits ?? 0) >= 590 {
+                (referenceEDR, bonus) = (2.66, 0.50)
+            } else {
+                (referenceEDR, bonus) = (3.2, 0.59)
+            }
+        } else {
+            (referenceEDR, bonus) = (2.66, 0.60)
+        }
+
+        let ratio = headroom / referenceEDR
+        guard defaults.bool(forKey: "fineGrainedBrightnessControl") else {
+            return 1 + bonus * min(ratio, 1)
+        }
+
+        let requested = min(max(defaults.double(forKey: "brightness"), 0), 1)
+        if requested > 0.995 {
+            return 1 + bonus * ratio
+        }
+        return 1 + bonus * min(ratio, requested)
+    }
+
     private func findReadableControl() -> NSObject? {
         // Apple displays connected over USB/Thunderbolt expose their calibrated
         // luminance through the HID controller. Built-in displays use the
         // AppleBacklight controller, so keep that as a fallback.
+        var calibratedFallback: NSObject?
         for className in ["BCHIDBrtControl", "BCAppleBacklightBrtControl"] {
             for candidate in availableControls(forClassNamed: className) {
+                if calibratedFallback == nil,
+                   candidate.responds(to: NSSelectorFromString("minNits")),
+                   candidate.responds(to: NSSelectorFromString("maxNits")),
+                   let minimum = candidate.value(forKey: "minNits") as? Double,
+                   let maximum = candidate.value(forKey: "maxNits") as? Double,
+                   minimum >= 0,
+                   maximum > minimum {
+                    calibratedFallback = candidate
+                }
+
                 let selector = NSSelectorFromString("getNitsWithError:")
                 guard let method = class_getInstanceMethod(type(of: candidate), selector) else { continue }
                 let function = unsafeBitCast(method_getImplementation(method), to: GetNitsFunction.self)
@@ -123,7 +273,7 @@ private final class BrightnessReader {
                 }
             }
         }
-        return nil
+        return calibratedFallback
     }
 
     private func availableControls(forClassNamed className: String) -> [NSObject] {
@@ -247,7 +397,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         )
         if reading.isExtended {
             displayItem.title = "\(formatNits(Int(reading.sdrNits.rounded()))) nits SDR × \(String(format: "%.2f", reading.edrGain))"
-            rangeItem.title = "HDR peak available now: \(formatNits(Int(reading.edrCeilingNits.rounded()))) nits"
+            rangeItem.title = "Display peak: \(formatNits(Int(reading.edrCeilingNits.rounded()))) nits"
         } else {
             displayItem.title = reader.displayName
 
@@ -309,6 +459,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 @main
 private struct NitsBarMain {
     static func main() {
+        if CommandLine.arguments.contains("--print-reading") {
+            print(BrightnessReader().diagnosticLine())
+            return
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate

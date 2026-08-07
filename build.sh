@@ -14,11 +14,18 @@ xcrun swiftc \
   -parse-as-library \
   -O \
   -framework AppKit \
+  -framework IOKit \
   -framework ServiceManagement \
   "$project_dir/NitsBar.swift" \
   -o "$contents_dir/MacOS/NitsBar"
 
 cp "$project_dir/Info.plist" "$contents_dir/Info.plist"
-codesign --force --sign - "$app_dir"
+xattr -cr "$app_dir"
+if ! codesign --force --sign - "$app_dir"; then
+  # File Provider can reattach Finder metadata between the clear and sign
+  # operations in Documents. Clear once more and retry deterministically.
+  xattr -cr "$app_dir"
+  codesign --force --sign - "$app_dir"
+fi
 
 echo "$app_dir"
