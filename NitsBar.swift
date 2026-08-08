@@ -8,6 +8,9 @@ private let brightnessFrameworkPath = "/System/Library/PrivateFrameworks/Brightn
 private let displayServicesFrameworkPath = "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices"
 private let brightIntoshBundleIdentifier = "de.brightintosh.app"
 private let brightIntoshDefaultsSuite = "group.de.brightintosh.app"
+private let appleDisplayVendorID: UInt32 = 0x610
+private let studioDisplayXDRModelID: UInt32 = 0xae42
+private let studioDisplayXDRPeakNits = 2_000.0
 
 private struct LuminanceReading {
     let sdrNits: Double
@@ -164,6 +167,16 @@ private final class BrightnessReader {
                 if nits.isFinite, nits > 0 { return nits }
             }
         }
+
+        // Studio Display XDR's HID brightness control reports only its normal
+        // 4–600-nit SDR range. Identify the panel by its stable CoreGraphics
+        // hardware IDs so that range is not mistaken for the physical HDR peak.
+        let displayID = CGMainDisplayID()
+        if CGDisplayVendorNumber(displayID) == appleDisplayVendorID,
+           CGDisplayModelNumber(displayID) == studioDisplayXDRModelID {
+            return studioDisplayXDRPeakNits
+        }
+
         return currentBuiltInPanelNits().flatMap { panelNits in
             guard let maximumNits, panelNits > maximumNits else { return nil }
             return panelNits
@@ -340,11 +353,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func configureStatusItem() {
         guard let button = statusItem.button else { return }
-        let image = NSImage(systemSymbolName: "sun.max.fill", accessibilityDescription: "Display luminance")
-        image?.isTemplate = true
-        button.image = image
-        button.imagePosition = .imageLeading
-        button.imageScaling = .scaleProportionallyDown
+        button.image = nil
         button.toolTip = "Current effective display luminance"
         statusItem.menu = menu
     }
@@ -386,10 +395,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         lastRoundedValue = rounded
 
         let effective = formatNits(rounded)
-        let prefix = reading.isExtended ? "≈" : ""
-        setStatusTitle("\(prefix)\(effective) nits")
+        setStatusTitle("\(effective) nits")
         valueItem.attributedTitle = NSAttributedString(
-            string: "\(prefix)\(effective) nits · \(reading.isExtended ? "Vivid/EDR" : "SDR")",
+            string: "\(effective) nits · \(reading.isExtended ? "Vivid/EDR" : "SDR")",
             attributes: [
                 .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
                 .foregroundColor: NSColor.labelColor
@@ -416,7 +424,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func setStatusTitle(_ title: String) {
         guard let button = statusItem.button else { return }
         button.attributedTitle = NSAttributedString(
-            string: " \(title)",
+            string: title,
             attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium),
                 .foregroundColor: NSColor.labelColor
