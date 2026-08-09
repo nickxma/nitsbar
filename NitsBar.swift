@@ -1,332 +1,189 @@
 import AppKit
+import Darwin
 import Foundation
-import IOKit
-import ObjectiveC.runtime
 import ServiceManagement
 
-private let brightnessFrameworkPath = "/System/Library/PrivateFrameworks/BrightnessControl.framework/BrightnessControl"
 private let displayServicesFrameworkPath = "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices"
-private let brightIntoshBundleIdentifier = "de.brightintosh.app"
-private let brightIntoshDefaultsSuite = "group.de.brightintosh.app"
-private let appleDisplayVendorID: UInt32 = 0x610
-private let studioDisplayXDRModelID: UInt32 = 0xae42
-private let studioDisplayXDRPeakNits = 2_000.0
+private let totalBrightnessSteps = 32
+private let controlPortName = "com.nickmauro.NitsBar.control"
+private let decreaseBrightnessMessageID: Int32 = 1
+private let increaseBrightnessMessageID: Int32 = 2
 
-private struct LuminanceReading {
-    let sdrNits: Double
-    let edrGain: Double
-    let effectiveNits: Double
-    let edrCeilingNits: Double
-
-    var isExtended: Bool { edrGain > 1.01 }
+private struct BrightnessState {
+    let stepIndex: Int
+    let normalizedValue: Double
 }
 
-private final class BrightnessReader {
-    private typealias CopyControlsFunction = @convention(c) (AnyClass, Selector) -> Unmanaged<AnyObject>?
-    private typealias GetNitsFunction = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<AnyObject?>?) -> Double
-    private typealias GetLinearBrightnessFunction = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
+private final class DisplayBrightnessController {
+    private typealias GetBrightnessFunction = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
+    private typealias SetBrightnessFunction = @convention(c) (CGDirectDisplayID, Float) -> Int32
 
     private var frameworkHandle: UnsafeMutableRawPointer?
-    private var displayServicesHandle: UnsafeMutableRawPointer?
-    private var getLinearBrightness: GetLinearBrightnessFunction?
-    private var control: NSObject?
-    private var isBuiltInDisplay = false
-    private(set) var displayName = "Display"
-    private(set) var minimumNits: Double?
-    private(set) var maximumNits: Double?
-    private(set) var physicalPeakNits: Double?
+    private var getBrightness: GetBrightnessFunction?
+    private var setBrightness: SetBrightnessFunction?
+    private var displayIDs: [CGDirectDisplayID] = []
+    private(set) var lastFailure = "none"
+
+    var isAvailable: Bool { getBrightness != nil && setBrightness != nil }
 
     init() {
-        frameworkHandle = dlopen(brightnessFrameworkPath, RTLD_NOW)
-        displayServicesHandle = dlopen(displayServicesFrameworkPath, RTLD_NOW)
-        if let displayServicesHandle,
-           let symbol = dlsym(displayServicesHandle, "DisplayServicesGetLinearBrightness") {
-            getLinearBrightness = unsafeBitCast(symbol, to: GetLinearBrightnessFunction.self)
+        frameworkHandle = dlopen(displayServicesFrameworkPath, RTLD_NOW)
+        if let frameworkHandle,
+           let getSymbol = dlsym(frameworkHandle, "DisplayServicesGetBrightness"),
+           let setSymbol = dlsym(frameworkHandle, "DisplayServicesSetBrightness") {
+            getBrightness = unsafeBitCast(getSymbol, to: GetBrightnessFunction.self)
+            setBrightness = unsafeBitCast(setSymbol, to: SetBrightnessFunction.self)
         }
-        refreshDisplay()
+        refreshDisplays()
     }
 
     deinit {
         if let frameworkHandle {
             dlclose(frameworkHandle)
         }
-        if let displayServicesHandle {
-            dlclose(displayServicesHandle)
+    }
+
+    func currentMainState() -> BrightnessState? {
+        guard let getBrightness else { return nil }
+        var value: Float = 0
+        guard getBrightness(CGMainDisplayID(), &value) == 0, value.isFinite else { return nil }
+        return state(for: value)
+    }
+
+    @discardableResult
+    func adjustAllDisplays(bySteps stepDelta: Int) -> BrightnessState? {
+        guard stepDelta != 0,
+              let getBrightness,
+              let setBrightness else {
+            lastFailure = "DisplayServices brightness functions are unavailable"
+            return nil
         }
+
+        let mainDisplayID = CGMainDisplayID()
+        var mainState: BrightnessState?
+        var firstState: BrightnessState?
+        var failures: [String] = []
+
+        for displayID in activeDisplayIDs() {
+            var currentValue: Float = 0
+            let getResult = getBrightness(displayID, &currentValue)
+            guard getResult == 0, currentValue.isFinite else {
+                failures.append("display \(displayID) read returned \(getResult)")
+                continue
+            }
+
+            let currentStep = state(for: currentValue).stepIndex
+            let targetStep = min(max(currentStep + stepDelta, 0), totalBrightnessSteps)
+            let targetValue = Float(targetStep) / Float(totalBrightnessSteps)
+            let setResult = setBrightness(displayID, targetValue)
+            guard setResult == 0 else {
+                failures.append("display \(displayID) write returned \(setResult)")
+                continue
+            }
+
+            let targetState = BrightnessState(stepIndex: targetStep, normalizedValue: Double(targetValue))
+            if displayID == mainDisplayID { mainState = targetState }
+            if firstState == nil { firstState = targetState }
+        }
+
+        if mainState == nil, firstState == nil {
+            lastFailure = failures.isEmpty ? "no active display accepted brightness control" : failures.joined(separator: "; ")
+        } else {
+            lastFailure = "none"
+        }
+        return mainState ?? firstState
     }
 
-    func refreshDisplay() {
-        displayName = NSScreen.main?.localizedName ?? NSScreen.screens.first?.localizedName ?? "Display"
-        isBuiltInDisplay = CGDisplayIsBuiltin(CGMainDisplayID()) != 0
-        control = findReadableControl()
-        minimumNits = control?.value(forKey: "minNits") as? Double
-        maximumNits = control?.value(forKey: "maxNits") as? Double
-        physicalPeakNits = currentPhysicalPeakNits()
-    }
+    @discardableResult
+    func setAllDisplays(toStep requestedStep: Int) -> BrightnessState? {
+        guard let setBrightness else { return nil }
 
-    func currentReading() -> LuminanceReading? {
-        guard let sdrNits = currentCalibratedSDRNits() ?? currentBuiltInSDRNits() else { return nil }
-        let transferGain = currentTransferGain()
-        let overlayGain = currentBrightIntoshOverlayGain()
-        let uncappedGain = max(1, transferGain * overlayGain)
-        let peak = physicalPeakNits ?? maximumNits ?? sdrNits
-        let effectiveNits = min(sdrNits * uncappedGain, peak)
-        let gain = sdrNits > 0 ? effectiveNits / sdrNits : 1
+        let targetStep = min(max(requestedStep, 0), totalBrightnessSteps)
+        let targetValue = Float(targetStep) / Float(totalBrightnessSteps)
+        let targetState = BrightnessState(stepIndex: targetStep, normalizedValue: Double(targetValue))
+        let mainDisplayID = CGMainDisplayID()
+        var mainState: BrightnessState?
+        var firstState: BrightnessState?
 
-        return LuminanceReading(
-            sdrNits: sdrNits,
-            edrGain: gain,
-            effectiveNits: effectiveNits,
-            edrCeilingNits: max(effectiveNits, peak)
-        )
+        for displayID in activeDisplayIDs() {
+            guard setBrightness(displayID, targetValue) == 0 else { continue }
+            if displayID == mainDisplayID { mainState = targetState }
+            if firstState == nil { firstState = targetState }
+        }
+
+        return mainState ?? firstState
     }
 
     func diagnosticLine() -> String {
-        guard let reading = currentReading() else { return "unavailable" }
+        guard let state = currentMainState() else { return "unavailable" }
+        let displayName = NSScreen.main?.localizedName ?? NSScreen.screens.first?.localizedName ?? "Display"
         return String(
-            format: "sdr=%.3f gain=%.4f effective=%.3f peak=%.3f display=%@",
-            reading.sdrNits,
-            reading.edrGain,
-            reading.effectiveNits,
-            reading.edrCeilingNits,
+            format: "step=%d/%d brightness=%.6f display=%@",
+            state.stepIndex,
+            totalBrightnessSteps,
+            state.normalizedValue,
             displayName
         )
     }
 
-    private func currentBuiltInSDRNits() -> Double? {
-        guard isBuiltInDisplay,
-              let getLinearBrightness,
-              let maximumNits,
-              maximumNits > 0 else { return nil }
-
-        var linearBrightness: Float = 0
-        guard getLinearBrightness(CGMainDisplayID(), &linearBrightness) == 0,
-              linearBrightness.isFinite else { return nil }
-
-        let minimum = max(0, minimumNits ?? 0)
-        return max(minimum, maximumNits * min(max(Double(linearBrightness), 0), 1))
-    }
-
-    private func currentCalibratedSDRNits() -> Double? {
-        guard let control else { return nil }
-        let selector = NSSelectorFromString("getNitsWithError:")
-        guard let method = class_getInstanceMethod(type(of: control), selector) else { return nil }
-
-        let function = unsafeBitCast(method_getImplementation(method), to: GetNitsFunction.self)
-        var error: AnyObject?
-        let value = function(control, selector, &error)
-        guard error == nil, value.isFinite, value >= 0 else { return nil }
-        return value
-    }
-
-    private func currentBuiltInPanelNits() -> Double? {
-        for className in ["IOMobileFramebufferShim", "IOMobileFramebuffer"] {
-            guard let matching = IOServiceMatching(className) else { continue }
-            var iterator: io_iterator_t = 0
-            guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
-                continue
-            }
-            defer { IOObjectRelease(iterator) }
-
-            var service = IOIteratorNext(iterator)
-            while service != 0 {
-                let currentService = service
-                defer { IOObjectRelease(currentService) }
-
-                let external = IORegistryEntryCreateCFProperty(
-                    currentService,
-                    "external" as CFString,
-                    kCFAllocatorDefault,
-                    0
-                )?.takeRetainedValue() as? NSNumber
-
-                if external?.boolValue != true,
-                   let fixedPoint = IORegistryEntryCreateCFProperty(
-                       currentService,
-                       "IOMFBBrightnessLevel" as CFString,
-                       kCFAllocatorDefault,
-                       0
-                   )?.takeRetainedValue() as? NSNumber {
-                    let nits = fixedPoint.doubleValue / 65_536
-                    if nits.isFinite, nits > 0, nits < 10_000 {
-                        return nits
-                    }
-                }
-
-                service = IOIteratorNext(iterator)
-            }
+    func refreshDisplays() {
+        var seen = Set<CGDirectDisplayID>()
+        displayIDs = NSScreen.screens.compactMap { screen in
+            guard let displayID = (
+                screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+            )?.uint32Value,
+                seen.insert(displayID).inserted else { return nil }
+            return displayID
         }
-        return nil
-    }
-
-    private func currentPhysicalPeakNits() -> Double? {
-        let capabilities = control?.value(forKey: "capabilities") as? NSDictionary
-        for key in ["MaxNitsEDR", "MaxNitsPanel", "LmaxProduct"] {
-            if let value = capabilities?[key] as? NSNumber {
-                let nits = value.doubleValue
-                if nits.isFinite, nits > 0 { return nits }
-            }
-        }
-
-        // Studio Display XDR's HID brightness control reports only its normal
-        // 4–600-nit SDR range. Identify the panel by its stable CoreGraphics
-        // hardware IDs so that range is not mistaken for the physical HDR peak.
-        let displayID = CGMainDisplayID()
-        if CGDisplayVendorNumber(displayID) == appleDisplayVendorID,
-           CGDisplayModelNumber(displayID) == studioDisplayXDRModelID {
-            return studioDisplayXDRPeakNits
-        }
-
-        return currentBuiltInPanelNits().flatMap { panelNits in
-            guard let maximumNits, panelNits > maximumNits else { return nil }
-            return panelNits
+        if displayIDs.isEmpty {
+            displayIDs = [CGMainDisplayID()]
         }
     }
 
-    private func currentTransferGain() -> Double {
-        let capacity: UInt32 = 4096
-        var red = [CGGammaValue](repeating: 0, count: Int(capacity))
-        var green = red
-        var blue = red
-        var sampleCount: UInt32 = 0
-
-        guard CGGetDisplayTransferByTable(
-            CGMainDisplayID(),
-            capacity,
-            &red,
-            &green,
-            &blue,
-            &sampleCount
-        ) == .success, sampleCount > 0 else {
-            return 1
-        }
-
-        let last = Int(sampleCount - 1)
-        // Neutral UI white uses all three channels. Weight the live transfer
-        // endpoints by luminance so color-temperature adjustments do not look
-        // like an artificial brightness increase.
-        let whiteGain = 0.2126 * Double(red[last])
-            + 0.7152 * Double(green[last])
-            + 0.0722 * Double(blue[last])
-        guard whiteGain.isFinite else { return 1 }
-        return max(1, whiteGain)
+    private func state(for brightness: Float) -> BrightnessState {
+        let normalized = Double(min(max(brightness, 0), 1))
+        let step = min(max(Int((normalized * Double(totalBrightnessSteps)).rounded()), 0), totalBrightnessSteps)
+        return BrightnessState(stepIndex: step, normalizedValue: normalized)
     }
 
-    private func currentEDRHeadroom() -> Double {
-        let displayID = CGMainDisplayID()
-        let screen = NSScreen.screens.first { screen in
-            (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-                == displayID
-        } ?? NSScreen.main
-        let headroom = screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1
-        guard headroom.isFinite else { return 1 }
-        return max(1, headroom)
-    }
-
-    private func currentBrightIntoshOverlayGain() -> Double {
-        guard NSRunningApplication.runningApplications(withBundleIdentifier: brightIntoshBundleIdentifier)
-            .contains(where: { !$0.isTerminated }),
-              let defaults = UserDefaults(suiteName: brightIntoshDefaultsSuite),
-              defaults.bool(forKey: "active"),
-              defaults.bool(forKey: "useAlternateBrightnessBackend") else {
-            return 1
-        }
-
-        let headroom = currentEDRHeadroom()
-        guard headroom > 1.05 else { return 1 }
-
-        let referenceEDR: Double
-        let bonus: Double
-        if isBuiltInDisplay {
-            if (maximumNits ?? 0) >= 590 {
-                (referenceEDR, bonus) = (2.66, 0.50)
-            } else {
-                (referenceEDR, bonus) = (3.2, 0.59)
-            }
-        } else {
-            (referenceEDR, bonus) = (2.66, 0.60)
-        }
-
-        let ratio = headroom / referenceEDR
-        guard defaults.bool(forKey: "fineGrainedBrightnessControl") else {
-            return 1 + bonus * min(ratio, 1)
-        }
-
-        let requested = min(max(defaults.double(forKey: "brightness"), 0), 1)
-        if requested > 0.995 {
-            return 1 + bonus * ratio
-        }
-        return 1 + bonus * min(ratio, requested)
-    }
-
-    private func findReadableControl() -> NSObject? {
-        // Apple displays connected over USB/Thunderbolt expose their calibrated
-        // luminance through the HID controller. Built-in displays use the
-        // AppleBacklight controller, so keep that as a fallback.
-        var calibratedFallback: NSObject?
-        for className in ["BCHIDBrtControl", "BCAppleBacklightBrtControl"] {
-            for candidate in availableControls(forClassNamed: className) {
-                if calibratedFallback == nil,
-                   candidate.responds(to: NSSelectorFromString("minNits")),
-                   candidate.responds(to: NSSelectorFromString("maxNits")),
-                   let minimum = candidate.value(forKey: "minNits") as? Double,
-                   let maximum = candidate.value(forKey: "maxNits") as? Double,
-                   minimum >= 0,
-                   maximum > minimum {
-                    calibratedFallback = candidate
-                }
-
-                let selector = NSSelectorFromString("getNitsWithError:")
-                guard let method = class_getInstanceMethod(type(of: candidate), selector) else { continue }
-                let function = unsafeBitCast(method_getImplementation(method), to: GetNitsFunction.self)
-                var error: AnyObject?
-                let value = function(candidate, selector, &error)
-                if error == nil, value.isFinite, value >= 0 {
-                    return candidate
-                }
-            }
-        }
-        return calibratedFallback
-    }
-
-    private func availableControls(forClassNamed className: String) -> [NSObject] {
-        guard frameworkHandle != nil,
-              let controlClass: AnyClass = NSClassFromString(className)
-        else { return [] }
-
-        let selector = NSSelectorFromString("copyAvailableControls")
-        guard let method = class_getClassMethod(controlClass, selector) else { return [] }
-        let function = unsafeBitCast(method_getImplementation(method), to: CopyControlsFunction.self)
-        guard let result = function(controlClass, selector)?.takeRetainedValue() as? NSArray else { return [] }
-        return result.compactMap { $0 as? NSObject }
+    private func activeDisplayIDs() -> [CGDirectDisplayID] {
+        displayIDs
     }
 }
 
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private let reader = BrightnessReader()
+    private let brightnessController = DisplayBrightnessController()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
-    private let valueItem = NSMenuItem(title: "Reading display…", action: nil, keyEquivalent: "")
-    private let displayItem = NSMenuItem(title: "Display", action: nil, keyEquivalent: "")
-    private let rangeItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let valueItem = NSMenuItem(title: "Reading brightness…", action: nil, keyEquivalent: "")
+    private let stepItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let brightnessControlItem = NSMenuItem()
+    private let brightnessLabel = NSTextField(labelWithString: "Brightness")
+    private let brightnessFractionLabel = NSTextField(labelWithString: "—/32")
+    private let brightnessSlider = NSSlider(value: 0, minValue: 0, maxValue: 32, target: nil, action: nil)
     private lazy var launchAtLoginItem = NSMenuItem(
         title: "Launch at Login",
         action: #selector(toggleLaunchAtLogin),
         keyEquivalent: ""
     )
     private var timer: Timer?
-    private var lastRoundedValue: Int?
+    private var lastStepIndex: Int?
+    private var authoritativeState: BrightnessState?
+    private var authoritativeUntil = Date.distantPast
+    private var controlPort: CFMessagePort?
+    private var controlRunLoopSource: CFRunLoopSource?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         configureStatusItem()
         configureMenu()
-        refresh()
+        updateHUD(force: true)
+        configureControlPort()
 
-        timer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
-            self?.refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.updateHUD()
         }
-        timer?.tolerance = 0.15
+        timer?.tolerance = 0.05
 
         NotificationCenter.default.addObserver(
             self,
@@ -339,22 +196,41 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
         NotificationCenter.default.removeObserver(self)
+        if let controlRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), controlRunLoopSource, .commonModes)
+        }
+        if let controlPort {
+            CFMessagePortInvalidate(controlPort)
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
         updateLaunchAtLoginState()
-        refresh(force: true)
+        updateHUD(force: true)
     }
 
     @objc private func screenConfigurationChanged() {
-        reader.refreshDisplay()
-        refresh(force: true)
+        brightnessController.refreshDisplays()
+        authoritativeState = nil
+        authoritativeUntil = .distantPast
+        updateHUD(force: true)
+    }
+
+    fileprivate func handleControlMessage(_ messageID: Int32) -> BrightnessState? {
+        switch messageID {
+        case decreaseBrightnessMessageID:
+            return adjustBrightness(bySteps: -1)
+        case increaseBrightnessMessageID:
+            return adjustBrightness(bySteps: 1)
+        default:
+            return nil
+        }
     }
 
     private func configureStatusItem() {
         guard let button = statusItem.button else { return }
         button.image = nil
-        button.toolTip = "Current effective display luminance"
+        button.toolTip = "Exact macOS display brightness step"
         statusItem.menu = menu
     }
 
@@ -362,66 +238,126 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.delegate = self
 
         valueItem.isEnabled = false
-        displayItem.isEnabled = false
-        rangeItem.isEnabled = false
+        stepItem.isEnabled = false
         launchAtLoginItem.target = self
+        configureBrightnessControl()
 
         menu.addItem(valueItem)
-        menu.addItem(displayItem)
-        menu.addItem(rangeItem)
+        menu.addItem(stepItem)
+        menu.addItem(.separator())
+        menu.addItem(brightnessControlItem)
         menu.addItem(.separator())
         menu.addItem(launchAtLoginItem)
         menu.addItem(.separator())
 
-        let quitItem = NSMenuItem(title: "Quit NitsBar", action: #selector(quit), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit Brightness HUD", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
 
-    private func refresh(force: Bool = false) {
-        guard let reading = reader.currentReading() else {
-            if force || lastRoundedValue != nil {
-                lastRoundedValue = nil
-                setStatusTitle("— nits")
-                valueItem.title = "Luminance unavailable"
-                displayItem.title = reader.displayName
-                rangeItem.title = "This display does not expose calibrated nits"
+    private func configureControlPort() {
+        var context = CFMessagePortContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
+        )
+        var shouldFreeInfo = DarwinBoolean(false)
+        guard let port = CFMessagePortCreateLocal(
+            kCFAllocatorDefault,
+            controlPortName as CFString,
+            controlMessagePortCallback,
+            &context,
+            &shouldFreeInfo
+        ), let source = CFMessagePortCreateRunLoopSource(kCFAllocatorDefault, port, 0) else {
+            return
+        }
+
+        controlPort = port
+        controlRunLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+    }
+
+    private func configureBrightnessControl() {
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 54))
+
+        brightnessLabel.frame = NSRect(x: 14, y: 31, width: 170, height: 17)
+        brightnessLabel.font = .systemFont(ofSize: 12, weight: .medium)
+
+        brightnessFractionLabel.frame = NSRect(x: 204, y: 31, width: 62, height: 17)
+        brightnessFractionLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        brightnessFractionLabel.alignment = .right
+
+        brightnessSlider.frame = NSRect(x: 14, y: 7, width: 252, height: 20)
+        brightnessSlider.target = self
+        brightnessSlider.action = #selector(brightnessSliderChanged)
+        brightnessSlider.isContinuous = false
+        brightnessSlider.isEnabled = brightnessController.isAvailable
+        brightnessSlider.setAccessibilityLabel("Display brightness step")
+
+        view.addSubview(brightnessLabel)
+        view.addSubview(brightnessFractionLabel)
+        view.addSubview(brightnessSlider)
+        brightnessControlItem.view = view
+    }
+
+    private func updateHUD(force: Bool = false, knownState: BrightnessState? = nil) {
+        if let knownState {
+            authoritativeState = knownState
+            authoritativeUntil = Date().addingTimeInterval(0.30)
+        }
+
+        let state: BrightnessState?
+        if Date() < authoritativeUntil, let authoritativeState {
+            state = authoritativeState
+        } else {
+            authoritativeState = nil
+            state = brightnessController.currentMainState()
+        }
+
+        guard let state else {
+            brightnessSlider.isEnabled = false
+            brightnessFractionLabel.stringValue = "—/32"
+            if force || lastStepIndex != nil {
+                lastStepIndex = nil
+                setStatusTitle("—/32", accessibilityLabel: "Display brightness unavailable")
+                valueItem.title = "Brightness unavailable"
+                stepItem.title = "This display does not expose software brightness control"
             }
             return
         }
 
-        let rounded = Int(reading.effectiveNits.rounded())
-        guard force || rounded != lastRoundedValue else { return }
-        lastRoundedValue = rounded
+        brightnessSlider.isEnabled = true
+        brightnessSlider.integerValue = state.stepIndex
+        brightnessFractionLabel.stringValue = "\(state.stepIndex)/\(totalBrightnessSteps)"
 
-        let effective = formatNits(rounded)
-        setStatusTitle("\(effective) nits")
+        guard force || state.stepIndex != lastStepIndex else { return }
+        lastStepIndex = state.stepIndex
+
+        let fraction = "\(state.stepIndex)/\(totalBrightnessSteps)"
+        setStatusTitle(fraction, accessibilityLabel: "Display brightness, \(state.stepIndex) of \(totalBrightnessSteps)")
         valueItem.attributedTitle = NSAttributedString(
-            string: "\(effective) nits · \(reading.isExtended ? "Vivid/EDR" : "SDR")",
+            string: "Brightness · \(fraction)",
             attributes: [
                 .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
                 .foregroundColor: NSColor.labelColor
             ]
         )
-        if reading.isExtended {
-            displayItem.title = "\(formatNits(Int(reading.sdrNits.rounded()))) nits SDR × \(String(format: "%.2f", reading.edrGain))"
-            rangeItem.title = "Display peak: \(formatNits(Int(reading.edrCeilingNits.rounded()))) nits"
-        } else {
-            displayItem.title = reader.displayName
+        stepItem.title = "Each keypress moves 1/32 · 3.125%"
+    }
 
-            if let minimum = reader.minimumNits, let maximum = reader.maximumNits {
-                rangeItem.title = "Calibrated range: \(formatNits(Int(minimum.rounded())))–\(formatNits(Int(maximum.rounded()))) nits"
-            } else {
-                rangeItem.title = "Updates automatically"
-            }
+    @discardableResult
+    private func adjustBrightness(bySteps stepDelta: Int) -> BrightnessState? {
+        guard let target = brightnessController.adjustAllDisplays(bySteps: stepDelta) else {
+            NSSound.beep()
+            return nil
         }
+        updateHUD(force: true, knownState: target)
+        return target
     }
 
-    private func formatNits(_ value: Int) -> String {
-        NumberFormatter.localizedString(from: NSNumber(value: value), number: .decimal)
-    }
-
-    private func setStatusTitle(_ title: String) {
+    private func setStatusTitle(_ title: String, accessibilityLabel: String) {
         guard let button = statusItem.button else { return }
         button.attributedTitle = NSAttributedString(
             string: title,
@@ -430,7 +366,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 .foregroundColor: NSColor.labelColor
             ]
         )
-        button.setAccessibilityLabel("Display luminance, \(title)")
+        button.setAccessibilityLabel(accessibilityLabel)
     }
 
     private func updateLaunchAtLoginState() {
@@ -459,18 +395,87 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         updateLaunchAtLoginState()
     }
 
+    @objc private func brightnessSliderChanged(_ sender: NSSlider) {
+        let requestedStep = Int(sender.doubleValue.rounded())
+        guard let target = brightnessController.setAllDisplays(toStep: requestedStep) else {
+            NSSound.beep()
+            updateHUD(force: true)
+            return
+        }
+        updateHUD(force: true, knownState: target)
+    }
+
     @objc private func quit() {
         NSApp.terminate(nil)
     }
 }
 
+private let controlMessagePortCallback: CFMessagePortCallBack = { _, messageID, _, info in
+    guard let info else { return nil }
+    let delegate = Unmanaged<AppDelegate>.fromOpaque(info).takeUnretainedValue()
+    let acceptedStep = delegate.handleControlMessage(messageID)?.stepIndex ?? 255
+
+    let acknowledgement = Data([UInt8(acceptedStep)]) as CFData
+    return Unmanaged.passRetained(acknowledgement)
+}
+
+private func sendStepRequest(_ delta: Int) -> Int? {
+    let messageID: Int32
+    switch delta {
+    case -1:
+        messageID = decreaseBrightnessMessageID
+    case 1:
+        messageID = increaseBrightnessMessageID
+    default:
+        return nil
+    }
+
+    guard let remotePort = CFMessagePortCreateRemote(kCFAllocatorDefault, controlPortName as CFString) else {
+        return nil
+    }
+
+    var response: Unmanaged<CFData>?
+    let result = CFMessagePortSendRequest(
+        remotePort,
+        messageID,
+        Data() as CFData,
+        1.0,
+        1.0,
+        CFRunLoopMode.defaultMode.rawValue,
+        &response
+    )
+    guard result == kCFMessagePortSuccess,
+          let responseData = response?.takeRetainedValue(),
+          CFDataGetLength(responseData) == 1,
+          let byte = CFDataGetBytePtr(responseData),
+          byte.pointee <= totalBrightnessSteps else { return nil }
+    return Int(byte.pointee)
+}
+
 @main
 private struct NitsBarMain {
     static func main() {
-        if CommandLine.arguments.contains("--print-reading") {
-            print(BrightnessReader().diagnosticLine())
+        if let requestIndex = CommandLine.arguments.firstIndex(of: "--request-step") {
+            guard requestIndex + 1 < CommandLine.arguments.count,
+                  let delta = Int(CommandLine.arguments[requestIndex + 1]),
+                  delta == -1 || delta == 1 else {
+                fputs("usage: NitsBar --request-step <-1|1>\n", stderr)
+                exit(2)
+            }
+            guard let acceptedStep = sendStepRequest(delta) else {
+                fputs("Brightness HUD is not running or did not accept the step request.\n", stderr)
+                exit(1)
+            }
+            print("\(acceptedStep)/\(totalBrightnessSteps)")
             return
         }
+
+        if CommandLine.arguments.contains("--print-brightness")
+            || CommandLine.arguments.contains("--print-reading") {
+            print(DisplayBrightnessController().diagnosticLine())
+            return
+        }
+
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
